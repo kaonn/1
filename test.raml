@@ -1,0 +1,26 @@
+let cons(x1,x2) =
+  let _ = Raml.tick(1.0) in
+  x1::x2
+;;
+let nil =
+  let _ = Raml.tick(1.0) in
+  []
+;;
+let nat n =
+  let _ = Raml.tick(1.0) in
+  n
+;;
+
+
+let f = nat 0 in
+let x = nat 1 in
+let y = x in
+let z = nat 3 in
+let w = z in
+let v = w in
+let q = nil in
+let q1 = cons(y,q) in
+let q2 = cons(x,q1) in
+match q1 with
+| [] -> 1
+| u1::u2 -> u1
