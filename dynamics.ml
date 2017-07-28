@@ -12,7 +12,7 @@ module F = Set.Make(Int)
 module Var = Set.Make(String)
 
 type loc = int
-type value = Nat of int * loc | T of loc | F of loc | Null of loc | Loc of loc * loc | Pair of value * value * loc
+type value = Nat of int * loc | T of loc | F of loc | Null of loc | Loc of loc * loc | Pair of value * value * loc | Cl of (value V.t) * string * expression * loc
 
 type context = {m : int; st : value V.t; hp : value H.t; r : R.t; f : F.t}
 
@@ -29,10 +29,11 @@ let rec val_tostring : value -> string =
   | Null l -> "Null@"  ^Int.to_string l
   | Loc (l1,l2)  -> "L:" ^ (Int.to_string l1) ^ "@" ^ (Int.to_string l2)
   | Pair (v1,v2,l) -> "<" ^ (val_tostring v1) ^ ", " ^ (val_tostring v2) ^ ">@" ^ Int.to_string l
+  | Cl (cl,x,e,l) -> "[ " ^ st_tostring cl ^ ", " ^ x ^ ".<body>]@" ^ Int.to_string l
 
-let st_tostring : value V.t -> string =
+and st_tostring : value V.t -> string =
   fun st ->
-  List.fold_right (List.map (V.to_alist st) (fun (x,v) -> x ^ " -> " ^ val_tostring v ^ ", ")) ~init:"" ~f:(fun a b -> a^b)
+  "V : " ^ List.fold_right (List.map (V.to_alist st) (fun (x,v) -> x ^ " -> " ^ val_tostring v ^ ", ")) ~init:"" ~f:(fun a b -> a^b)
 
 let rec subst : Typedtree.expression -> Path.t -> Typedtree.expression -> Typedtree.expression =
     fun p1 p2 exp -> match exp.Typedtree.exp_desc with
@@ -165,7 +166,7 @@ module IterTree = TypedtreeIter.MakeIterator(
   let _ = IterTree.iter_expression e in
   !free_set *)
 
-let fv exp =
+let fv bound exp =
 
   let bound_names p = List.map (pat_bound_idents p) (fun (ident,_) -> Path.name (Path.Pident ident)) in
 
@@ -199,8 +200,7 @@ let fv exp =
     | Texp_construct (_,_,es,_) -> List.map es (traverse bound_set) |> Var.union_list
 
   in
-  traverse Var.empty exp
-
+  traverse bound exp
 
 let rec reach : context -> value -> R.t =
   fun ctx -> function
@@ -214,6 +214,10 @@ let rec reach : context -> value -> R.t =
     | _ -> raise (Fail "malformed heap"))
   | Pair (v1,v2,l) ->
     R.add (R.union (reach ctx v1) (reach ctx v2)) l
+  | Cl (cl,x,e,l) ->
+    let free = fv (Var.singleton x) e in
+    let f1 = List.map (Var.to_list free) (fun var -> V.find_exn cl var |> reach ctx) |> R.union_list in
+    R.add f1 l
 
 let rec hold : context -> R.t -> R.t =
   fun ctx r ->
@@ -225,7 +229,7 @@ let rec hold : context -> R.t -> R.t =
 
 let locs : context -> expression -> R.t =
   fun ctx e ->
-    let free = fv e in
+    let free = fv Var.empty e in
     Var.fold_right free ~init:R.empty ~f:(fun s acc ->
       match V.find ctx.st s with
       | Some v ->  R.union acc (reach ctx v)
@@ -233,6 +237,15 @@ let locs : context -> expression -> R.t =
       let _ = printf "stack: %s\n" (st_tostring ctx.st) in
       let _ = List.map (Var.to_list free) (fun s -> printf "%s," s) in
       raise (Fail ("unbound variable 1: " ^ s)))
+
+let stack : context -> expression -> value =
+  fun ctx e ->
+  match e.exp_desc with
+  | Texp_ident (path,_,_) ->
+    (match V.find ctx.st (Path.name path) with
+     | Some v -> v
+     | _ -> raise (Fail "malformed stack"))
+  | _ -> raise (Eval "expression not in let-normal form")
 
 let rec eval : context -> Typedtree.expression -> value * (value H.t) * int =
   fun ctx exp -> match exp.exp_desc with
@@ -272,13 +285,7 @@ let rec eval : context -> Typedtree.expression -> value * (value H.t) * int =
 
   | Texp_construct (_, {Types.cstr_name = "::"}, es,_) ->
   if ctx.m > 0 then
-    let [v1;v2] = List.map es (fun e ->
-      match e.exp_desc with
-      | Texp_ident (path,_,_) ->
-        (match V.find ctx.st (Path.name path) with
-         | Some v -> v
-         | _ -> raise (Fail "malformed stack"))
-      | _ -> raise (Eval "constructor not in let-normal form")) in
+    let [v1;v2] = List.map es (stack ctx) in
     let l = new_loc () in
     let v = Pair (v1,v2,l) in
     let hp' = H.add ctx.hp l v in
@@ -289,13 +296,7 @@ let rec eval : context -> Typedtree.expression -> value * (value H.t) * int =
 
   | Texp_tuple es ->
   if ctx.m > 0 then
-    let [v1;v2] = List.map es (fun e ->
-      match e.exp_desc with
-      | Texp_ident (path,_,_) ->
-        (match V.find ctx.st (Path.name path) with
-         | Some v -> v
-         | _ -> raise (Fail "malformed stack"))
-      | _ -> raise (Eval "constructor not in let-normal form")) in
+    let [v1;v2] = List.map es (stack ctx) in
     let l = new_loc () in
     let v = Pair (v1,v2,l) in
     let hp' = H.add ctx.hp l v in
@@ -304,36 +305,33 @@ let rec eval : context -> Typedtree.expression -> value * (value H.t) * int =
 
   | Texp_match (e,[(_,e1);({pat_desc = Tpat_construct (_,{Types.cstr_name="::"},ps,_)},e2)],_) ->
     begin
-    match e.exp_desc with
-    | Texp_ident (path,_,_) ->
-      (match V.find ctx.st (Path.name path) with
-       | Some v ->
-          (match v with
-           | Null l -> eval ctx e1
-           | Pair(v1,v2,l) ->
-            let [x1;x2] = List.map ps (fun p -> match p.pat_desc with Tpat_var (ident,_) -> Path.name (Path.Pident ident) | _ -> raise (Eval "pattern not in let-normal form")) in
-            let st' = V.add (V.add ctx.st x1 v1) x2 v2 in
-            eval ({ctx with st = st'}) e2
-           | _ -> raise (Fail "invalid value"))
-       | _ -> raise (Fail "malformed stack"))
-    | _ -> raise (Eval "match not in let-normal form")
+    match stack ctx e with
+    | Null l -> eval ctx e1
+    | Pair(v1,v2,l) ->
+      let [x1;x2] = List.map ps (fun p -> match p.pat_desc with Tpat_var (ident,_) -> Path.name (Path.Pident ident) | _ -> raise (Eval "pattern not in let-normal form")) in
+      let st' = V.add (V.add ctx.st x1 v1) x2 v2 in
+      eval ({ctx with st = st'}) e2
+    | _ -> raise (Fail "invalid value")
     end
 
-  (* | Texp_function (l,[p,e],part) ->
-  | Texp_apply of expression * (label * expression option * optional) list
+  | Texp_function (_,[{pat_desc = Tpat_var(ident,_)},e],_) ->
+  if ctx.m > 0 then
+    let l = new_loc () in
+    let v = Cl (ctx.st, Path.name (Path.Pident ident), e, l) in
+    let hp' = H.add ctx.hp l v in
+    v,hp',ctx.m-1
+  else raise (Eval "freelist insufficient")
 
-  | Texp_try of expression * (pattern * expression) list
-  | Texp_tuple of expression list
+  | Texp_apply (f, [_,eo,_]) ->
+    match eo with
+    | Some arg ->
+      let v = stack ctx arg in
+      let (Cl(cl,x,e',l)) = stack ctx f in
+      let cl' = V.add cl x v in
+      let ctx' = {ctx with st = cl'} in
+      eval ctx' e'
 
-  | Texp_variant of label * expression option
-  | Texp_record of
-      (Longident.t loc * label_description * expression) list *
-        expression option
-  | Texp_field of expression * Longident.t loc * label_description
-  | Texp_setfield of
-      expression * Longident.t loc * label_description * expression
-  | Texp_array of expression list
-  | Texp_ifthenelse of expression * expression * expression option
+  (* | Texp_ifthenelse of expression * expression * expression option
   | Texp_sequence of expression * expression *)
 
 let get_eval : structure -> expression =
