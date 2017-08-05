@@ -14,18 +14,21 @@ module P = Map.Make(String)
 
 type loc = int
 
+
 type value = Nat of int * loc | T of loc | F of loc | Null of loc | Loc of loc * loc | Pair of value * value * loc | Cl of (value V.t) * string option * string * expression * loc 
-           | Cont of (context -> value -> value * (value H.t) * int)
-and context = {m : int; st : value V.t; hp : value H.t; r : R.t; f : F.t ref; b : string option}
+           | Cont of (context -> value -> result)
+and result = value * (value H.t) * F.t
+and context = {st : value V.t; hp : value H.t; r : R.t; f : F.t; b : string option}
 
+let init : int -> F.t = fun n -> 
+  List.init n (fun i -> i) |> F.of_list
 
-let heap_start = ref 0
-let new_loc : unit -> loc =
-  fun _ ->
-  let l = !heap_start in
-  incr heap_start; l
-
-let init () = heap_start := 0
+let new_loc : F.t -> loc * F.t =
+  fun freelist ->
+    let min = F.min_elt freelist in 
+    match min with 
+    | Some m -> let f' = F.remove freelist m in m, f' 
+    | _ -> raise (Fail "cannot alloc from empty freelist")
 
 let get_loc : value -> loc = 
   function Nat (_,l) | T l | F l | Null l | Loc (_,l) | Pair (_,_,l) | Cl (_,_,_,_,l) -> l
@@ -36,15 +39,13 @@ let pervasives = P.of_alist_exn [
     fun ctx (Nat (a,_)) -> 
       Cont(
         fun ctx (Nat(b,_)) -> 
-          if ctx.m > 0 then 
-          let l = new_loc () in 
+          let l,f' = new_loc ctx.f in 
           let v = if a < b then T l else F l in 
           let hp' = H.add ctx.hp l v in 
-          v,hp',ctx.m - 1
-          else raise (Eval "freelist insufficient")
+          v,hp',f'
       )
       , ctx.hp
-      , ctx.m
+      , ctx.f
     )
     
   )
@@ -54,15 +55,13 @@ let pervasives = P.of_alist_exn [
     fun ctx (Nat (a,_)) -> 
       Cont(
         fun ctx (Nat(b,_)) -> 
-          if ctx.m > 0 then 
-          let l = new_loc () in 
+          let l,f' = new_loc ctx.f in 
           let v = if a <= b then T l else F l in 
           let hp' = H.add ctx.hp l v in 
-          v,hp',ctx.m - 1
-          else raise (Eval "freelist insufficient")
+          v,hp',f'
       )
       , ctx.hp
-      , ctx.m
+      , ctx.f
     )
     
   )
@@ -72,15 +71,13 @@ let pervasives = P.of_alist_exn [
     fun ctx (Nat (a,_)) -> 
       Cont(
         fun ctx (Nat(b,_)) -> 
-          if ctx.m > 0 then 
-          let l = new_loc () in 
+          let l,f' = new_loc ctx.f in 
           let v = if a = b then T l else F l in 
           let hp' = H.add ctx.hp l v in 
-          v,hp',ctx.m - 1
-          else raise (Eval "freelist insufficient")
+          v,hp',f'
       )
       , ctx.hp
-      , ctx.m
+      , ctx.f
     )
     
   )
@@ -91,15 +88,13 @@ let pervasives = P.of_alist_exn [
     fun ctx (Nat (a,_)) -> 
       Cont(
         fun ctx (Nat(b,_)) -> 
-          if ctx.m > 0 then 
-          let l = new_loc () in 
+          let l,f' = new_loc ctx.f in 
           let v = Nat (a - b, l) in
           let hp' = H.add ctx.hp l v in 
-          v,hp',ctx.m - 1
-          else raise (Eval "freelist insufficient")
+          v,hp',f'
       )
       , ctx.hp
-      , ctx.m
+      , ctx.f
     )
     
   )
@@ -109,25 +104,23 @@ let pervasives = P.of_alist_exn [
     fun ctx (Nat (a,_)) -> 
       Cont(
         fun ctx (Nat(b,_)) -> 
-          if ctx.m > 0 then 
-          let l = new_loc () in 
+          let l,f' = new_loc ctx.f in 
           let v = Nat (a * b, l) in
           let hp' = H.add ctx.hp l v in 
-          v,hp',ctx.m - 1
-          else raise (Eval "freelist insufficient")
+          v,hp',f'
       )
       , ctx.hp
-      , ctx.m
+      , ctx.f
     )
     
   )
   ;
   ("Pervasives.fst",
-    Cont(fun ctx (Pair (v1,v2,_)) -> v1 , ctx.hp , ctx.m)
+    Cont(fun ctx (Pair (v1,v2,_)) -> v1 , ctx.hp , ctx.f)
   )
   ;
   ("Pervasives.snd",
-    Cont(fun ctx (Pair (v1,v2,_)) -> v2 , ctx.hp , ctx.m)
+    Cont(fun ctx (Pair (v1,v2,_)) -> v2 , ctx.hp , ctx.f)
   )
 
 ]
@@ -144,6 +137,8 @@ let rec val_tostring : value -> string =
 and st_tostring : value V.t -> string =
   fun st ->
   "V : " ^ List.fold_right (List.map (V.to_alist st) (fun (x,v) -> x ^ " -> " ^ val_tostring v ^ ", ")) ~init:"" ~f:(fun a b -> a^b)
+
+let free_to_string free = "\n{" ^ F.fold free ~init:"" ~f:(fun acc e -> acc ^ Int.to_string e ^ ", ") ^ "}\n"
 
 
 let bound_set = ref Var.empty
@@ -271,98 +266,84 @@ let rec unravel : int -> value -> value list =
   | Pair (v1,v2,l) -> unravel (i - 1) v1 @ [v2]
   | _ -> raise (Fail "tuple unraveling failed@fct") )
 
-let rec eval' : context -> Typedtree.expression -> value * (value H.t) * int =
+
+let rec eval' : context -> Typedtree.expression -> result = 
+
+let check : F.t -> int -> unit = 
+  fun free thresh -> if F.length free >= thresh then () else raise (Eval "freelist insufficient")
+in
 fun ctx exp -> match exp.exp_desc with
 | Texp_ident (path,_,_) ->
   (match V.find ctx.st (Path.name path) with
-  | Some v -> v, ctx.hp, ctx.m
+  | Some v -> v, ctx.hp, ctx.f
   | _ -> 
       (match P.find pervasives (Path.name path) with 
-      | Some p -> p, ctx.hp, ctx.m
+      | Some p -> p, ctx.hp, ctx.f
       | _ -> raise (Eval "unbound variable 2")))
 
 | Texp_constant c ->
   (match c with
    | Asttypes.Const_int i ->
-    if ctx.m > 0 then
-      let l = new_loc () in
+      let l,f' = new_loc ctx.f in
       let v = Nat (i, l) in
-      v, H.add ctx.hp l v, ctx.m - 1
-    else raise (Eval "freelist insufficient")
+      v, H.add ctx.hp l v, f'
    | _ -> raise (Eval "unsupported constant"))
 
 | Texp_let (_, [], e) -> eval' ctx e
 | Texp_let (rflag, ({pat_desc = Tpat_var (ident,_)} as p,e1)::xs, e2) ->
   let e' = {exp with exp_desc = Texp_let (rflag, xs, e2)} in
-(*   let r' = R.union ctx.r (locs ctx (mk_exp (exp.exp_env) (Texp_function ("", [p,e'], Total)) (Ctype.newty (Types.Tarrow ("",p.pat_type,e'.exp_type,Types.Cok))))) in *)
   let r' = try R.union ctx.r (locs ctx (Var.singleton (Path.name (Path.Pident ident))) e') with _ -> raise (Fail (Path.name (Path.Pident ident))) in 
   let rec_bind = match rflag with Asttypes.Recursive -> Some (Path.name (Path.Pident ident)) | _ -> None in
-  let v1, hp1, m1 = eval' ({ctx with r = r'; b = rec_bind}) e1 in
-  let ctx' = {ctx with st = V.add ctx.st (Path.name (Path.Pident ident)) v1; hp = hp1} in
+  let v1, hp1, f1 = eval' ({ctx with r = r'; b = rec_bind}) e1 in
+  let ctx' = {ctx with st = V.add ctx.st (Path.name (Path.Pident ident)) v1; hp = hp1; f = f1} in
   let r'' = R.union ctx.r (locs ctx' Var.empty e') in
-  let g = H.filter ctx'.hp ~f:(fun ~key:l ~data:_ -> not (R.mem (hold ctx' r'') l || F.mem !(ctx.f) l)) |> H.keys in
-  let g' = H.filter ctx'.hp ~f:(fun ~key:l ~data:_ -> not (R.mem (hold ctx' r'') l || F.mem !(ctx.f) l)) |> H.to_alist in
+  let g = H.filter ctx'.hp ~f:(fun ~key:l ~data:_ -> not (R.mem (hold ctx' r'') l || F.mem ctx'.f l)) |> H.keys |> F.of_list in
+  let g' = H.filter ctx'.hp ~f:(fun ~key:l ~data:_ -> not (R.mem (hold ctx' r'') l || F.mem ctx'.f l)) |> H.to_alist in
   let _ = 
     printf "garbage at loc (for e1): ";
     Location.print Format.std_formatter e1.exp_loc;
     List.iter g' (fun (l,v) -> printf "\n,%s --> %s" (Int.to_string l) (val_tostring v)); printf "\n" in
-(*
-  let _ = 
-    printf "heap at loc (for e1): ";
-    Location.print Format.std_formatter e1.exp_loc;
-    List.iter (ctx'.hp |> H.to_alist) (fun (l,v) -> printf "\n,%s --> %s" (Int.to_string l) (val_tostring v)); printf "\n" in
-*)
-  let _ = 
-    printf "freed at loc: ";
-    List.iter (F.to_list !(ctx'.f)) (fun e -> printf "\n,%s" (Int.to_string e));
-    ctx.f := F.union (!(ctx.f)) (F.of_list g) in
-    eval' ({ctx' with m = m1 + List.length g}) e'
+  eval' ({ctx' with f = F.union ctx'.f g}) e'
 
 | Texp_construct (_, {Types.cstr_name = "[]"}, _, _) ->
-if ctx.m > 0 then
-  let l = new_loc () in
+  let l,f' = new_loc ctx.f in
   let v = Null l in
   let hp' = H.add ctx.hp l v in
-  v,hp',ctx.m-1
-else raise (Eval "freelist insufficient")
+  v,hp',f'
 
 | Texp_construct (_, {Types.cstr_name = "::"}, [e1;e2],_) ->
   let free = locs ctx Var.empty e2 in 
   let ctx1 = {ctx with r = R.union ctx.r free} in 
-  let v1,hp1,m1 = eval' ctx1 e1 in
-  let ctx2 = {ctx with m = m1; hp = hp1} in 
-  let v2,hp2,m2 = eval' ctx2 e2 in 
-if m2 > 0 then
-  let l = new_loc () in
+  let v1,hp1,f1 = eval' ctx1 e1 in
+  let ctx2 = {ctx with hp = hp1; f = f1} in 
+  let v2,hp2,f2 = eval' ctx2 e2 in 
+  let l,f' = new_loc f2 in
   let v = Pair (v1,v2,l) in
   let hp' = H.add hp2 l v in
-  v,hp',m2-1
-else raise (Eval "freelist insufficient")
+  v,hp',f'
 
 | Texp_construct _ -> raise (Eval "unsupported constructor")
 
 | Texp_tuple (e::es) -> 
   let free = List.map es (locs ctx Var.empty) |> R.union_list in 
-  let v1,h1,m1 = eval' {ctx with r = R.union ctx.r free} e in
-  List.foldi es ~init:(v1,h1,m1) ~f:(fun i (v,h,m) e -> 
+  let v1,h1,f1 = eval' {ctx with r = R.union ctx.r free} e in
+  List.foldi es ~init:(v1,h1,f1) ~f:(fun i (v,h,f) e -> 
     let after = List.drop es (i+1) in 
     let free = List.map after (locs ctx Var.empty) |> R.union_list in
     let hold = R.add free (get_loc v)  in
-    let vc,hc,mc = eval' {ctx with m = m; hp = h; r = R.union ctx.r hold} e in 
-    if mc > 0 then
-      let l = new_loc () in 
+    let vc,hc,fc = eval' {ctx with hp = h; r = R.union ctx.r hold; f = f} e in 
+      let l,f' = new_loc fc in 
       let v' = Pair (v,vc,l) in 
       let hp' = H.add hc l v' in
-      v',hp', mc-1
-    else raise (Eval "freelist insufficient"))
+      v',hp', f')
 
 | Texp_match (e,[{pat_desc = Tpat_tuple ps} as p,e'],_) ->
   let free = locs ctx (bound_names p) e' in 
-  let v,hp',m' = eval' {ctx with r = R.union ctx.r free} e in 
+  let v,hp',f' = eval' {ctx with r = R.union ctx.r free} e in 
   let bound_vars = List.map ps (fun p -> match p.pat_desc with Tpat_var (ident,_) -> Path.name (Path.Pident ident) | _ -> raise (Eval "pattern not in let-normal form")) in
   let vals = unravel (List.length bound_vars - 1) v in 
   let st' = try List.fold2_exn bound_vars vals ~init:ctx.st ~f:(fun acc a b -> V.add acc a b) with Invalid_argument _ -> raise (Fail "tuple unraveling failed") in 
-  let ctx' = {ctx with m = m'; st = st'; hp = hp'} in 
+  let ctx' = {ctx with  st = st'; hp = hp';f = f'} in 
   eval' ctx' e'
 
 
@@ -371,8 +352,8 @@ else raise (Eval "freelist insufficient")
     match name with 
     | "::" -> 
       let free = R.union (locs ctx Var.empty e1) (locs ctx (bound_names p) e2) in 
-      let v,hp',m' = eval' {ctx with r = R.union ctx.r free} e in 
-      let ctx' = {ctx with m = m'; hp = hp'} in 
+      let v,hp',f' = eval' {ctx with r = R.union ctx.r free} e in 
+      let ctx' = {ctx with f = f'; hp = hp'} in 
       begin
       match v with
       | Null l -> eval' ctx' e1
@@ -386,40 +367,38 @@ else raise (Eval "freelist insufficient")
   
 
 | Texp_function (_,[{pat_desc = Tpat_var(ident,_)},e],_) ->
-if ctx.m > 0 then
-  let l = new_loc () in
+  let l,f' = new_loc ctx.f in
   let v = Cl (ctx.st, ctx.b, Path.name (Path.Pident ident), e, l) in
   let hp' = H.add ctx.hp l v in
-  v,hp',ctx.m-1
-else raise (Eval "freelist insufficient")
+  v,hp',f'
 
 | Texp_apply (e1, es) ->
   let args  = List.map es (fun (_,eo,_) -> match eo with Some e -> e | _ -> raise (Eval "labeled arguments not supported")) in 
   let free = List.map args (locs ctx Var.empty) |> R.union_list in 
-  let v1,h1,m1 = eval' {ctx with r = R.union ctx.r free} e1 in
-  List.foldi args ~init:(v1,h1,m1) ~f:(fun i (f,h,m) earg -> 
+  let v1,h1,f1 = eval' {ctx with r = R.union ctx.r free} e1 in
+  List.foldi args ~init:(v1,h1,f1) ~f:(fun i (fct,h,f) earg -> 
     let after = List.drop args (i + 1) in
     let free = List.map after (locs ctx Var.empty) |> R.union_list in
-    match f with 
+    match fct with 
     | Cl (cl,name,x,e,l) -> 
     let hold = R.add free l in 
-    let arg,hp',m' = eval' {ctx with m = m; hp = h; r = R.union ctx.r hold} earg in 
+    let arg,hp',f' = eval' {ctx with f = f; hp = h; r = R.union ctx.r hold} earg in 
     let st' = V.add cl x arg in
     let st'' = match name with Some fname -> V.add st' fname (Cl(ctx.st,name,x,e,l)) | _ -> st' in 
-    let ctx' = {ctx with m = m'; st = st''; hp = hp'; r = R.union ctx.r free} in 
+    let ctx' = {ctx with f = f'; st = st''; hp = hp'; r = R.union ctx.r free} in 
     eval' ctx' e
 
     | Cont cont -> 
-    let arg,hp',m' = eval' {ctx with m = m; hp = h; r = R.union ctx.r free} earg in 
-    cont {ctx with m = m'; hp = hp'} arg
+    let arg,hp',f' = eval' {ctx with f = f; hp = h; r = R.union ctx.r free} earg in 
+    cont {ctx with f = f'; hp = hp'} arg
 
     | _ -> raise (Fail "cannot apply non-function type"))
 
 
 | Texp_ifthenelse (e,et,Some ef) -> 
     let free = R.union (locs ctx Var.empty et) (locs ctx Var.empty ef) in 
-    let v,hp',m' = eval' {ctx with r = R.union ctx.r free} e in 
-    let ctx' = {ctx with m = m'; hp = hp'} in 
+    let v,hp',f' = eval' {ctx with r = R.union ctx.r free} e in 
+    let ctx' = {ctx with f = f'; hp = hp'} in 
     begin
       match v with
     | T _ -> eval' ctx' et
@@ -446,8 +425,8 @@ let bound ctx e n =
     if i > n then raise (Eval "insufficient freelist")
     else
       try
-        let _ = init () in
-        let _,_,m' = eval' {ctx with m = i} e in i,m'
+        let free = init i in
+        let _,_,f' = eval' {ctx with f = free} e in i,f'
       with Eval "freelist insufficient" -> trying (i+1)
   in  
     trying 0
@@ -456,7 +435,7 @@ let main () =
   if Array.length Sys.argv <> 3 then raise (Fail "incorrect arity")
   else
   let file = Sys.argv.(1) in
-  let freelist = Sys.argv.(2) |> Int.of_string in
+  let free = Sys.argv.(2) |> Int.of_string in
   let s = In_channel.read_all file in
   let ast = s |> Lexing.from_string |> Parse.implementation in
   let env =
@@ -467,9 +446,10 @@ let main () =
   with Typetexp.Error (_,_,error) -> Typetexp.report_error env Format.std_formatter error; raise (Fail "") in
   let _ = Printtyped.implementation Format.std_formatter tree in
   let e = get_eval tree in
-  let empty = {m=freelist;st=V.empty;hp=H.empty;r=R.empty;f = ref F.empty; b = None} in
-  let v,hp',m' = eval' empty (get_eval tree) in
-  let _ = printf "value: %s\nm: %d\nm': %d\n\n" (val_tostring v) freelist m' in ()
+  let freelist = init free in
+  let empty = {f=freelist;st=V.empty;hp=H.empty;r=R.empty; b = None} in
+  let v,hp',f' = eval' empty (get_eval tree) in
+  let _ = printf "value: %s\nf: %s\nf': %s\n\n" (val_tostring v) (free_to_string freelist) (free_to_string f') in ()
 (*
   let high,remain = bound empty e freelist in
   printf "high water mark: %d\nremain: %d\n\n" high remain
