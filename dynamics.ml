@@ -14,9 +14,9 @@ module P = Map.Make(String)
 
 type loc = int
 
-type value = Nat of int * loc | T of loc | F of loc | Null of loc | Loc of loc * loc | Pair of value * value * loc | Cl of (value V.t) * string * expression * loc 
+type value = Nat of int * loc | T of loc | F of loc | Null of loc | Loc of loc * loc | Pair of value * value * loc | Cl of (value V.t) * string option * string * expression * loc 
            | Cont of (context -> value -> value * (value H.t) * int)
-and context = {m : int; st : value V.t; hp : value H.t; r : R.t; f : F.t}
+and context = {m : int; st : value V.t; hp : value H.t; r : R.t; f : F.t ref; b : string option}
 
 
 let heap_start = ref 0
@@ -25,8 +25,10 @@ let new_loc : unit -> loc =
   let l = !heap_start in
   incr heap_start; l
 
+let init () = heap_start := 0
+
 let get_loc : value -> loc = 
-  function Nat (_,l) | T l | F l | Null l | Loc (_,l) | Pair (_,_,l) | Cl (_,_,_,l) -> l
+  function Nat (_,l) | T l | F l | Null l | Loc (_,l) | Pair (_,_,l) | Cl (_,_,_,_,l) -> l
   
 let pervasives = P.of_alist_exn [
   ("Pervasives.<",
@@ -46,6 +48,88 @@ let pervasives = P.of_alist_exn [
     )
     
   )
+  ;
+  ("Pervasives.<=",
+    Cont(
+    fun ctx (Nat (a,_)) -> 
+      Cont(
+        fun ctx (Nat(b,_)) -> 
+          if ctx.m > 0 then 
+          let l = new_loc () in 
+          let v = if a <= b then T l else F l in 
+          let hp' = H.add ctx.hp l v in 
+          v,hp',ctx.m - 1
+          else raise (Eval "freelist insufficient")
+      )
+      , ctx.hp
+      , ctx.m
+    )
+    
+  )
+  ;
+  ("Pervasives.=",
+    Cont(
+    fun ctx (Nat (a,_)) -> 
+      Cont(
+        fun ctx (Nat(b,_)) -> 
+          if ctx.m > 0 then 
+          let l = new_loc () in 
+          let v = if a = b then T l else F l in 
+          let hp' = H.add ctx.hp l v in 
+          v,hp',ctx.m - 1
+          else raise (Eval "freelist insufficient")
+      )
+      , ctx.hp
+      , ctx.m
+    )
+    
+  )
+
+  ;
+  ("Pervasives.-",
+    Cont(
+    fun ctx (Nat (a,_)) -> 
+      Cont(
+        fun ctx (Nat(b,_)) -> 
+          if ctx.m > 0 then 
+          let l = new_loc () in 
+          let v = Nat (a - b, l) in
+          let hp' = H.add ctx.hp l v in 
+          v,hp',ctx.m - 1
+          else raise (Eval "freelist insufficient")
+      )
+      , ctx.hp
+      , ctx.m
+    )
+    
+  )
+  ;
+  ("Pervasives.*",
+    Cont(
+    fun ctx (Nat (a,_)) -> 
+      Cont(
+        fun ctx (Nat(b,_)) -> 
+          if ctx.m > 0 then 
+          let l = new_loc () in 
+          let v = Nat (a * b, l) in
+          let hp' = H.add ctx.hp l v in 
+          v,hp',ctx.m - 1
+          else raise (Eval "freelist insufficient")
+      )
+      , ctx.hp
+      , ctx.m
+    )
+    
+  )
+  ;
+  ("Pervasives.fst",
+    Cont(fun ctx (Pair (v1,v2,_)) -> v1 , ctx.hp , ctx.m)
+  )
+  ;
+  ("Pervasives.snd",
+    Cont(fun ctx (Pair (v1,v2,_)) -> v2 , ctx.hp , ctx.m)
+  )
+
 ]
 
 let rec val_tostring : value -> string =
@@ -55,7 +139,7 @@ let rec val_tostring : value -> string =
   | Null l -> "Null@"  ^Int.to_string l
   | Loc (l1,l2)  -> "L:" ^ (Int.to_string l1) ^ "@" ^ (Int.to_string l2)
   | Pair (v1,v2,l) -> "<" ^ (val_tostring v1) ^ ", " ^ (val_tostring v2) ^ ">@" ^ Int.to_string l
-  | Cl (cl,x,e,l) -> "[ " ^ st_tostring cl ^ ", " ^ x ^ ".<body>]@" ^ Int.to_string l
+  | Cl (cl,o,x,e,l) -> "[ " ^ "<<stack>>" ^ ", " ^ (match o with Some n -> "fix: " ^ n | _ -> "fix: _") ^ ", " ^ x ^ ".<body>]@" ^ Int.to_string l
 
 and st_tostring : value V.t -> string =
   fun st ->
@@ -103,7 +187,8 @@ let fv bound exp =
     | Texp_constant _ -> Var.empty
     | Texp_let (_,[],e) -> traverse bound_set e
     | Texp_let (rflag,(p,e)::xs,e1) ->
-      let f1 = traverse bound_set e in
+      let rec_bind = match rflag with Asttypes.Recursive -> bound_names p | _ -> Var.empty in 
+      let f1 = traverse (Var.union bound_set rec_bind) e in
       let e' = {exp with exp_desc = Texp_let (rflag,xs,e1)} in
       let f2 = traverse (Var.union bound_set (bound_names p)) e' in
       Var.union f1 f2
@@ -148,9 +233,11 @@ let rec reach : context -> value -> R.t =
     | _ -> raise (Fail "malformed heap"))
   | Pair (v1,v2,l) ->
     R.add (R.union (reach ctx v1) (reach ctx v2)) l
-  | Cl (cl,x,e,l) ->
-    let free = fv (Var.singleton x) e in
-    let f1 = List.map (Var.to_list free) (fun var -> V.find_exn cl var |> reach ctx) |> R.union_list in
+  | Cl (cl,o,x,e,l) ->
+    let bound = match o with Some n -> Var.of_list [n;x] | _ -> Var.singleton x in
+    let free = fv bound e in
+    let f1 = List.map (Var.to_list free) (fun var -> (try V.find_exn cl var with _ -> 
+     try P.find_exn pervasives var with _ -> raise (Fail var)) |> reach ctx) |> R.union_list in
     R.add f1 l
   | Cont cont -> R.empty
 
@@ -170,105 +257,11 @@ let locs : context -> Var.t -> expression-> R.t =
       | Some v ->  R.union acc (reach ctx v)
       | _ -> 
           (match P.find pervasives s with 
-           | Some v -> R.union acc (reach ctx v)
+           | Some p -> R.union acc (reach ctx p)
            | _ ->
       let _ = printf "stack: %s\n" (st_tostring ctx.st) in
       let _ = List.map (Var.to_list free) (fun s -> printf "%s," s) in
       raise (Fail ("unbound variable 1: " ^ s))))
-
-let stack : context -> expression -> value =
-  fun ctx e ->
-  match e.exp_desc with
-  | Texp_ident (path,_,_) ->
-    (match V.find ctx.st (Path.name path) with
-     | Some v -> v
-     | _ -> raise (Fail "malformed stack"))
-  | _ -> raise (Eval "expression not in let-normal form")
-
-(*let rec eval : context -> Typedtree.expression -> value * (value H.t) * int =
-  fun ctx exp -> match exp.exp_desc with
-  | Texp_ident (path,_,_) ->
-    (match V.find ctx.st (Path.name path) with
-    | Some v -> v, ctx.hp, ctx.m
-    | _ -> raise (Eval "unbound variable 2"))
-
-  | Texp_constant c ->
-    (match c with
-     | Asttypes.Const_int i ->
-      if ctx.m > 0 then
-        let l = new_loc () in
-        let v = Nat (i, l) in
-        v, H.add ctx.hp l v, ctx.m - 1
-      else raise (Eval "freelist insufficient")
-     | _ -> raise (Eval "unsupported constant"))
-
-  | Texp_let (_, [], e) -> eval ctx e
-  | Texp_let (rflag, ({pat_desc = Tpat_var (ident,_)} as p,e1)::xs, e2) ->
-    let e' = {exp with exp_desc = Texp_let (rflag, xs, e2)} in
-    let r' = R.union ctx.r (locs ctx (mk_exp (exp.exp_env) (Texp_function ("", [p,e'], Total)) (Ctype.newty (Types.Tarrow ("",p.pat_type,e'.exp_type,Types.Cok))))) in
-    let v1, hp1, m1 = eval ({ctx with r = r'}) e1 in
-    let ctx' = {ctx with st = V.add ctx.st (Path.name (Path.Pident ident)) v1; hp = hp1} in
-    let r'' = R.union ctx.r (locs ctx' e') in
-    let g = H.filter ctx'.hp ~f:(fun ~key:l ~data:_ -> not (R.mem (hold ctx' r'') l || F.mem ctx.f l)) |> H.keys in
-    let _ = printf "g: %s\n" (Int.to_string (List.length g)) in
-      eval ({ctx' with m = m1 + List.length g; f = F.union ctx.f (F.of_list g)}) e'
-
-  | Texp_construct (_, {Types.cstr_name = "[]"}, _, _) ->
-  if ctx.m > 0 then
-    let l = new_loc () in
-    let v = Null l in
-    let hp' = H.add ctx.hp l v in
-    v,hp',ctx.m-1
-  else raise (Eval "freelist insufficient")
-
-  | Texp_construct (_, {Types.cstr_name = "::"}, es,_) ->
-  if ctx.m > 0 then
-    let [v1;v2] = List.map es (stack ctx) in
-    let l = new_loc () in
-    let v = Pair (v1,v2,l) in
-    let hp' = H.add ctx.hp l v in
-    v,hp',ctx.m-1
-  else raise (Eval "freelist insufficient")
-
-  | Texp_construct _ -> raise (Eval "unsupported constructor")
-
-  | Texp_tuple es ->
-  if ctx.m > 0 then
-    let [v1;v2] = List.map es (stack ctx) in
-    let l = new_loc () in
-    let v = Pair (v1,v2,l) in
-    let hp' = H.add ctx.hp l v in
-    v,hp',ctx.m-1
-  else raise (Eval "freelist insufficient")
-
-  | Texp_match (e,[(_,e1);({pat_desc = Tpat_construct (_,{Types.cstr_name="::"},ps,_)},e2)],_) ->
-    begin
-    match stack ctx e with
-    | Null l -> eval ctx e1
-    | Pair(v1,v2,l) ->
-      let [x1;x2] = List.map ps (fun p -> match p.pat_desc with Tpat_var (ident,_) -> Path.name (Path.Pident ident) | _ -> raise (Eval "pattern not in let-normal form")) in
-      let st' = V.add (V.add ctx.st x1 v1) x2 v2 in
-      eval ({ctx with st = st'}) e2
-    | _ -> raise (Fail "invalid value")
-    end
-
-  | Texp_function (_,[{pat_desc = Tpat_var(ident,_)},e],_) ->
-  if ctx.m > 0 then
-    let l = new_loc () in
-    let v = Cl (ctx.st, Path.name (Path.Pident ident), e, l) in
-    let hp' = H.add ctx.hp l v in
-    v,hp',ctx.m-1
-  else raise (Eval "freelist insufficient")
-
-  | Texp_apply (f, [_,eo,_]) ->
-    match eo with
-    | Some arg ->
-      let v = stack ctx arg in
-      let (Cl(cl,x,e',l)) = stack ctx f in
-      let cl' = V.add cl x v in
-      let ctx' = {ctx with st = cl'} in
-      eval ctx' e'
-      *)
 
 let rec unravel : int -> value -> value list = 
   fun i v -> 
@@ -302,13 +295,28 @@ fun ctx exp -> match exp.exp_desc with
 | Texp_let (rflag, ({pat_desc = Tpat_var (ident,_)} as p,e1)::xs, e2) ->
   let e' = {exp with exp_desc = Texp_let (rflag, xs, e2)} in
 (*   let r' = R.union ctx.r (locs ctx (mk_exp (exp.exp_env) (Texp_function ("", [p,e'], Total)) (Ctype.newty (Types.Tarrow ("",p.pat_type,e'.exp_type,Types.Cok))))) in *)
-  let r' = R.union ctx.r (locs ctx (Var.singleton (Path.name (Path.Pident ident))) e') in 
-  let v1, hp1, m1 = eval' ({ctx with r = r'}) e1 in
+  let r' = try R.union ctx.r (locs ctx (Var.singleton (Path.name (Path.Pident ident))) e') with _ -> raise (Fail (Path.name (Path.Pident ident))) in 
+  let rec_bind = match rflag with Asttypes.Recursive -> Some (Path.name (Path.Pident ident)) | _ -> None in
+  let v1, hp1, m1 = eval' ({ctx with r = r'; b = rec_bind}) e1 in
   let ctx' = {ctx with st = V.add ctx.st (Path.name (Path.Pident ident)) v1; hp = hp1} in
   let r'' = R.union ctx.r (locs ctx' Var.empty e') in
-  let g = H.filter ctx'.hp ~f:(fun ~key:l ~data:_ -> not (R.mem (hold ctx' r'') l || F.mem ctx.f l)) |> H.keys in
-  let _ = printf "g: %s\n" (Int.to_string (List.length g)) in
-    eval' ({ctx' with m = m1 + List.length g; f = F.union ctx.f (F.of_list g)}) e'
+  let g = H.filter ctx'.hp ~f:(fun ~key:l ~data:_ -> not (R.mem (hold ctx' r'') l || F.mem !(ctx.f) l)) |> H.keys in
+  let g' = H.filter ctx'.hp ~f:(fun ~key:l ~data:_ -> not (R.mem (hold ctx' r'') l || F.mem !(ctx.f) l)) |> H.to_alist in
+  let _ = 
+    printf "garbage at loc (for e1): ";
+    Location.print Format.std_formatter e1.exp_loc;
+    List.iter g' (fun (l,v) -> printf "\n,%s --> %s" (Int.to_string l) (val_tostring v)); printf "\n" in
+(*
+  let _ = 
+    printf "heap at loc (for e1): ";
+    Location.print Format.std_formatter e1.exp_loc;
+    List.iter (ctx'.hp |> H.to_alist) (fun (l,v) -> printf "\n,%s --> %s" (Int.to_string l) (val_tostring v)); printf "\n" in
+*)
+  let _ = 
+    printf "freed at loc: ";
+    List.iter (F.to_list !(ctx'.f)) (fun e -> printf "\n,%s" (Int.to_string e));
+    ctx.f := F.union (!(ctx.f)) (F.of_list g) in
+    eval' ({ctx' with m = m1 + List.length g}) e'
 
 | Texp_construct (_, {Types.cstr_name = "[]"}, _, _) ->
 if ctx.m > 0 then
@@ -380,7 +388,7 @@ else raise (Eval "freelist insufficient")
 | Texp_function (_,[{pat_desc = Tpat_var(ident,_)},e],_) ->
 if ctx.m > 0 then
   let l = new_loc () in
-  let v = Cl (ctx.st, Path.name (Path.Pident ident), e, l) in
+  let v = Cl (ctx.st, ctx.b, Path.name (Path.Pident ident), e, l) in
   let hp' = H.add ctx.hp l v in
   v,hp',ctx.m-1
 else raise (Eval "freelist insufficient")
@@ -393,11 +401,12 @@ else raise (Eval "freelist insufficient")
     let after = List.drop args (i + 1) in
     let free = List.map after (locs ctx Var.empty) |> R.union_list in
     match f with 
-    | Cl (cl,x,e,l) ->
+    | Cl (cl,name,x,e,l) -> 
     let hold = R.add free l in 
     let arg,hp',m' = eval' {ctx with m = m; hp = h; r = R.union ctx.r hold} earg in 
     let st' = V.add cl x arg in
-    let ctx' = {ctx with m = m'; st = st'; hp = hp'; r = R.union ctx.r free} in 
+    let st'' = match name with Some fname -> V.add st' fname (Cl(ctx.st,name,x,e,l)) | _ -> st' in 
+    let ctx' = {ctx with m = m'; st = st''; hp = hp'; r = R.union ctx.r free} in 
     eval' ctx' e
 
     | Cont cont -> 
@@ -407,18 +416,21 @@ else raise (Eval "freelist insufficient")
     | _ -> raise (Fail "cannot apply non-function type"))
 
 
-  | Texp_ifthenelse (e,et,Some ef) -> 
-      let free = R.union (locs ctx Var.empty et) (locs ctx Var.empty ef) in 
-      let v,hp',m' = eval' {ctx with r = R.union ctx.r free} e in 
-      let ctx' = {ctx with m = m'; hp = hp'} in 
-      begin
-        match v with
-      | T _ -> eval' ctx' et
-      | F _ -> eval' ctx' ef
-      | _ -> raise (Fail "invalid value: bool expected")
-      end
+| Texp_ifthenelse (e,et,Some ef) -> 
+    let free = R.union (locs ctx Var.empty et) (locs ctx Var.empty ef) in 
+    let v,hp',m' = eval' {ctx with r = R.union ctx.r free} e in 
+    let ctx' = {ctx with m = m'; hp = hp'} in 
+    begin
+      match v with
+    | T _ -> eval' ctx' et
+    | F _ -> eval' ctx' ef
+    | _ -> raise (Fail "invalid value: bool expected")
+    end
 
-  | Texp_ifthenelse (e,et,_) -> raise (Eval "else branch not optional")
+| Texp_ifthenelse (e,et,_) -> raise (Eval "else branch not optional")
+
+| _ ->
+    raise (Eval "unsupported expression")
 
 
     
@@ -434,9 +446,10 @@ let bound ctx e n =
     if i > n then raise (Eval "insufficient freelist")
     else
       try
+        let _ = init () in
         let _,_,m' = eval' {ctx with m = i} e in i,m'
       with Eval "freelist insufficient" -> trying (i+1)
-  in
+  in  
     trying 0
 
 let main () =
@@ -454,10 +467,12 @@ let main () =
   with Typetexp.Error (_,_,error) -> Typetexp.report_error env Format.std_formatter error; raise (Fail "") in
   let _ = Printtyped.implementation Format.std_formatter tree in
   let e = get_eval tree in
-  let empty = {m=freelist;st=V.empty;hp=H.empty;r=R.empty;f = F.empty} in
+  let empty = {m=freelist;st=V.empty;hp=H.empty;r=R.empty;f = ref F.empty; b = None} in
   let v,hp',m' = eval' empty (get_eval tree) in
-  let _ = printf "value: %s\nm: %d\nm': %d\n\n" (val_tostring v) freelist m' in
+  let _ = printf "value: %s\nm: %d\nm': %d\n\n" (val_tostring v) freelist m' in ()
+(*
   let high,remain = bound empty e freelist in
   printf "high water mark: %d\nremain: %d\n\n" high remain
+*)
 ;;
 main ()
