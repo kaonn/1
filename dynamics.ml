@@ -266,12 +266,11 @@ let rec unravel : int -> value -> value list =
   | Pair (v1,v2,l) -> unravel (i - 1) v1 @ [v2]
   | _ -> raise (Fail "tuple unraveling failed@fct") )
 
-
+let collect : context -> R.t -> R.t = 
+  fun ctx r -> 
+  H.filter ctx.hp ~f:(fun ~key:l ~data:_ -> not (R.mem (hold ctx r) l || F.mem ctx.f l)) |> H.keys |> R.of_list
+    
 let rec eval' : context -> Typedtree.expression -> result = 
-
-let check : F.t -> int -> unit = 
-  fun free thresh -> if F.length free >= thresh then () else raise (Eval "freelist insufficient")
-in
 fun ctx exp -> match exp.exp_desc with
 | Texp_ident (path,_,_) ->
   (match V.find ctx.st (Path.name path) with
@@ -297,12 +296,12 @@ fun ctx exp -> match exp.exp_desc with
   let v1, hp1, f1 = eval' ({ctx with r = r'; b = rec_bind}) e1 in
   let ctx' = {ctx with st = V.add ctx.st (Path.name (Path.Pident ident)) v1; hp = hp1; f = f1} in
   let r'' = R.union ctx.r (locs ctx' Var.empty e') in
-  let g = H.filter ctx'.hp ~f:(fun ~key:l ~data:_ -> not (R.mem (hold ctx' r'') l || F.mem ctx'.f l)) |> H.keys |> F.of_list in
-  let g' = H.filter ctx'.hp ~f:(fun ~key:l ~data:_ -> not (R.mem (hold ctx' r'') l || F.mem ctx'.f l)) |> H.to_alist in
+  let g = collect ctx' r'' in 
+  (* let g' = H.filter ctx'.hp ~f:(fun ~key:l ~data:_ -> not (R.mem (hold ctx' r'') l || F.mem ctx'.f l)) |> H.to_alist in
   let _ = 
     printf "garbage at loc (for e1): ";
     Location.print Format.std_formatter e1.exp_loc;
-    List.iter g' (fun (l,v) -> printf "\n,%s --> %s" (Int.to_string l) (val_tostring v)); printf "\n" in
+    List.iter g' (fun (l,v) -> printf "\n,%s --> %s" (Int.to_string l) (val_tostring v)); printf "\n" in *)
   eval' ({ctx' with f = F.union ctx'.f g}) e'
 
 | Texp_construct (_, {Types.cstr_name = "[]"}, _, _) ->
@@ -316,7 +315,10 @@ fun ctx exp -> match exp.exp_desc with
   let ctx1 = {ctx with r = R.union ctx.r free} in 
   let v1,hp1,f1 = eval' ctx1 e1 in
   let ctx2 = {ctx with hp = hp1; f = f1} in 
-  let v2,hp2,f2 = eval' ctx2 e2 in 
+  let r = R.union ctx.r free in 
+  let g = collect ctx2 r in 
+  let ctx3 = {ctx2 with f = F.union ctx2.f g} in 
+  let v2,hp2,f2 = eval' ctx3 e2 in 
   let l,f' = new_loc f2 in
   let v = Pair (v1,v2,l) in
   let hp' = H.add hp2 l v in
@@ -331,7 +333,10 @@ fun ctx exp -> match exp.exp_desc with
     let after = List.drop es (i+1) in 
     let free = List.map after (locs ctx Var.empty) |> R.union_list in
     let hold = R.add free (get_loc v)  in
-    let vc,hc,fc = eval' {ctx with hp = h; r = R.union ctx.r hold; f = f} e in 
+    let ctx' = {ctx with hp = h; r = R.union ctx.r hold; f = f} in 
+    let g = collect ctx' (R.union ctx'.r (locs ctx' Var.empty e)) in 
+    let ctx2 = {ctx' with f = F.union ctx'.f g} in 
+    let vc,hc,fc = eval' ctx2 e in 
       let l,f' = new_loc fc in 
       let v' = Pair (v,vc,l) in 
       let hp' = H.add hc l v' in
@@ -344,7 +349,10 @@ fun ctx exp -> match exp.exp_desc with
   let vals = unravel (List.length bound_vars - 1) v in 
   let st' = try List.fold2_exn bound_vars vals ~init:ctx.st ~f:(fun acc a b -> V.add acc a b) with Invalid_argument _ -> raise (Fail "tuple unraveling failed") in 
   let ctx' = {ctx with  st = st'; hp = hp';f = f'} in 
-  eval' ctx' e'
+  let r = R.union ctx'.r (locs ctx' Var.empty e') in 
+  let g = collect ctx' r in 
+  let ctx2 = {ctx' with f = F.union ctx'.f g} in 
+  eval' ctx2 e'
 
 
 | Texp_match (e,[({pat_desc = Tpat_construct (_,{Types.cstr_name="[]"},[],_)},e1);({pat_desc = Tpat_construct (_,{Types.cstr_name=name},ps,_)} as p,e2)],_) ->
@@ -353,14 +361,22 @@ fun ctx exp -> match exp.exp_desc with
     | "::" -> 
       let free = R.union (locs ctx Var.empty e1) (locs ctx (bound_names p) e2) in 
       let v,hp',f' = eval' {ctx with r = R.union ctx.r free} e in 
-      let ctx' = {ctx with f = f'; hp = hp'} in 
       begin
       match v with
-      | Null l -> eval' ctx' e1
+      | Null l -> 
+      let ctx' = {ctx with f = f'; hp = hp'} in 
+      let r = R.union ctx'.r (locs ctx' Var.empty e1) in 
+      let g = collect ctx' r in
+      let ctx2 = {ctx' with f = F.union ctx'.f g} in
+      eval' ctx2 e1
       | Pair(v1,v2,l) ->
         let [x1;x2] = List.map ps (fun p -> match p.pat_desc with Tpat_var (ident,_) -> Path.name (Path.Pident ident) | _ -> raise (Eval "pattern not in let-normal form")) in
         let st' = V.add (V.add ctx.st x1 v1) x2 v2 in
-        eval' ({ctx' with st = st'}) e2
+        let ctx' = {ctx with st = st'; f = f'; hp = hp'} in 
+        let r = R.union ctx'.r (locs ctx' Var.empty e2) in  
+        let g = collect ctx' r in
+        let ctx2 = {ctx' with f = F.union ctx'.f g} in
+        eval' ctx2 e2
       | _ -> raise (Fail "invalid value: nil or cons expected")
       end
   end
@@ -382,10 +398,15 @@ fun ctx exp -> match exp.exp_desc with
     match fct with 
     | Cl (cl,name,x,e,l) -> 
     let hold = R.add free l in 
-    let arg,hp',f' = eval' {ctx with f = f; hp = h; r = R.union ctx.r hold} earg in 
+    let ctx' = {ctx with f = f; hp = h; r = R.union ctx.r hold} in 
+    let r = R.union ctx'.r (locs ctx' Var.empty earg) in 
+    let g = collect ctx' r in
+    let ctx2 = {ctx' with f = F.union ctx'.f g} in 
+    let arg,hp',f' = eval' ctx2 earg in 
     let st' = V.add cl x arg in
     let st'' = match name with Some fname -> V.add st' fname (Cl(ctx.st,name,x,e,l)) | _ -> st' in 
     let ctx' = {ctx with f = f'; st = st''; hp = hp'; r = R.union ctx.r free} in 
+    let r1 = 
     eval' ctx' e
 
     | Cont cont -> 
