@@ -10,3 +10,4 @@ let q2 = x::q1 in
 match q2 with
 | [] -> 1
 | u1::u2 -> u1
+| u1::u2::u3 -> u1

@@ -150,7 +150,8 @@ let mk_exp : Env.t -> Typedtree.expression_desc -> Types.type_expr -> expression
       Typedtree.exp_loc = Location.none;
       Typedtree.exp_extra = [];
       Typedtree.exp_type = t;
-      Typedtree.exp_env = env}
+      Typedtree.exp_env = env;
+      Typedtree.exp_attributes = []}
 
 let mk_exp_var : Env.t -> Path.t -> Types.type_expr -> Typedtree.expression =
   fun env path t ->
@@ -159,6 +160,7 @@ let mk_exp_var : Env.t -> Path.t -> Types.type_expr -> Typedtree.expression =
       Types.val_type = t;
       Types.val_kind = Types.Val_reg;
       Types.val_loc = Location.none;
+      Types.val_attributes = [];
     } in
     let desc = Typedtree.Texp_ident (path, Location.mknoloc (Longident.Lident ""), val_desc) in
     mk_exp env desc t
@@ -169,7 +171,8 @@ let mk_pat : Env.t -> Typedtree.pattern_desc -> Types.type_expr -> Typedtree.pat
       Typedtree.pat_loc = Location.none;
       Typedtree.pat_extra = [];
       Typedtree.pat_type = t;
-      Typedtree.pat_env = env}
+      Typedtree.pat_env = env;
+      Typedtree.pat_attributes = []}
 
 let bound_names p = List.map (pat_bound_idents p) (fun (ident,_) -> Path.name (Path.Pident ident)) |> Var.of_list
 
@@ -181,28 +184,29 @@ let fv bound exp =
       if Var.mem bound_set (Path.name path) then Var.empty else Var.singleton (Path.name path)
     | Texp_constant _ -> Var.empty
     | Texp_let (_,[],e) -> traverse bound_set e
-    | Texp_let (rflag,(p,e)::xs,e1) ->
+    | Texp_let (rflag,{vb_pat=p;vb_expr=e}::xs,e1) ->
       let rec_bind = match rflag with Asttypes.Recursive -> bound_names p | _ -> Var.empty in 
       let f1 = traverse (Var.union bound_set rec_bind) e in
       let e' = {exp with exp_desc = Texp_let (rflag,xs,e1)} in
       let f2 = traverse (Var.union bound_set (bound_names p)) e' in
       Var.union f1 f2
 
-    | Texp_function (_,pes,_) -> List.map pes (fun (p,e) -> traverse (Var.union bound_set (bound_names p)) e) |> Var.union_list
+    | Texp_function (_,pes,_) -> List.map pes (fun {c_lhs=p;c_rhs=e} -> traverse (Var.union bound_set (bound_names p)) e) |> Var.union_list
 
     | Texp_apply (e,es) ->
       let f1 = traverse bound_set e in
       let f2 = List.map es (fun (_,eo,_) -> match eo with Some e' -> traverse bound_set e' | _ -> Var.empty) |> Var.union_list in
       Var.union f1 f2
 
-    | Texp_match (e,pes,_) ->
+    | Texp_match (e,cases,_,_) ->
+      let pes = List.map cases (fun {c_lhs=p;c_rhs=e} -> p,e) in
       let f1 = traverse bound_set e in
       let f2 = List.map pes (fun (p,e) -> traverse (Var.union bound_set (bound_names p)) e)  |> Var.union_list in
       Var.union f1 f2
 
     | Texp_tuple es -> List.map es (traverse bound_set) |> Var.union_list
 
-    | Texp_construct (_,_,es,_) -> List.map es (traverse bound_set) |> Var.union_list
+    | Texp_construct (_,_,es) -> List.map es (traverse bound_set) |> Var.union_list
 
     | Texp_ifthenelse (e,et,Some ef) -> 
         [
@@ -289,7 +293,7 @@ fun ctx exp -> match exp.exp_desc with
    | _ -> raise (Eval "unsupported constant"))
 
 | Texp_let (_, [], e) -> eval' ctx e
-| Texp_let (rflag, ({pat_desc = Tpat_var (ident,_)} as p,e1)::xs, e2) ->
+| Texp_let (rflag, ({vb_pat = {pat_desc = Tpat_var (ident,_)} as p; vb_expr = e1})::xs, e2) ->
   let e' = {exp with exp_desc = Texp_let (rflag, xs, e2)} in
   let r' = try R.union ctx.r (locs ctx (Var.singleton (Path.name (Path.Pident ident))) e') with _ -> raise (Fail (Path.name (Path.Pident ident))) in 
   let rec_bind = match rflag with Asttypes.Recursive -> Some (Path.name (Path.Pident ident)) | _ -> None in
@@ -304,13 +308,13 @@ fun ctx exp -> match exp.exp_desc with
     List.iter g' (fun (l,v) -> printf "\n,%s --> %s" (Int.to_string l) (val_tostring v)); printf "\n" in *)
   eval' ({ctx' with f = F.union ctx'.f g}) e'
 
-| Texp_construct (_, {Types.cstr_name = "[]"}, _, _) ->
+| Texp_construct (_, {Types.cstr_name = "[]"}, _) ->
   let l,f' = new_loc ctx.f in
   let v = Null l in
   let hp' = H.add ctx.hp l v in
   v,hp',f'
 
-| Texp_construct (_, {Types.cstr_name = "::"}, [e1;e2],_) ->
+| Texp_construct (_, {Types.cstr_name = "::"}, [e1;e2]) ->
   let free = locs ctx Var.empty e2 in 
   let ctx1 = {ctx with r = R.union ctx.r free} in 
   let v1,hp1,f1 = eval' ctx1 e1 in
@@ -342,7 +346,7 @@ fun ctx exp -> match exp.exp_desc with
       let hp' = H.add hc l v' in
       v',hp', f')
 
-| Texp_match (e,[{pat_desc = Tpat_tuple ps} as p,e'],_) ->
+| Texp_match (e,[{c_lhs = {pat_desc = Tpat_tuple ps} as p; c_rhs=e'}],_,_) ->
   let free = locs ctx (bound_names p) e' in 
   let v,hp',f' = eval' {ctx with r = R.union ctx.r free} e in 
   let bound_vars = List.map ps (fun p -> match p.pat_desc with Tpat_var (ident,_) -> Path.name (Path.Pident ident) | _ -> raise (Eval "pattern not in let-normal form")) in
@@ -355,7 +359,7 @@ fun ctx exp -> match exp.exp_desc with
   eval' ctx2 e'
 
 
-| Texp_match (e,[({pat_desc = Tpat_construct (_,{Types.cstr_name="[]"},[],_)},e1);({pat_desc = Tpat_construct (_,{Types.cstr_name=name},ps,_)} as p,e2)],_) ->
+| Texp_match (e,[{c_lhs={pat_desc = Tpat_construct (_,{Types.cstr_name="[]"},[])}; c_rhs = e1}; {c_lhs={pat_desc = Tpat_construct (_,{Types.cstr_name=name},ps)} as p; c_rhs = e2}],_,_) ->
   begin 
     match name with 
     | "::" -> 
@@ -382,7 +386,7 @@ fun ctx exp -> match exp.exp_desc with
   end
   
 
-| Texp_function (_,[{pat_desc = Tpat_var(ident,_)},e],_) ->
+| Texp_function (_,[{c_lhs = {pat_desc = Tpat_var(ident,_)}; c_rhs=e}],_) ->
   let l,f' = new_loc ctx.f in
   let v = Cl (ctx.st, ctx.b, Path.name (Path.Pident ident), e, l) in
   let hp' = H.add ctx.hp l v in
@@ -407,9 +411,9 @@ fun ctx exp -> match exp.exp_desc with
     let st'' = match name with Some fname -> V.add st' fname (Cl(ctx.st,name,x,e,l)) | _ -> st' in 
     let ctx' = {ctx with f = f'; st = st''; hp = hp'; r = R.union ctx.r free} in 
     let r1 = 
-    eval' ctx' e
+    eval' ctx' e in r1
 
-    | Cont cont -> 
+    | Cont cont ->
     let arg,hp',f' = eval' {ctx with f = f; hp = h; r = R.union ctx.r free} earg in 
     cont {ctx with f = f'; hp = hp'} arg
 
@@ -439,7 +443,7 @@ fun ctx exp -> match exp.exp_desc with
 let get_eval : structure -> expression =
   function {str_items = [i]} ->
     match i.str_desc with
-    | Tstr_eval e -> e
+    | Tstr_eval (e,_) -> e
 
 let bound ctx e n =
   let rec trying i =
