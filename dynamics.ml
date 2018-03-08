@@ -273,7 +273,16 @@ let rec unravel : int -> value -> value list =
 let collect : context -> R.t -> R.t = 
   fun ctx r -> 
   H.filter ctx.hp ~f:(fun ~key:l ~data:_ -> not (R.mem (hold ctx r) l || F.mem ctx.f l)) |> H.keys |> R.of_list
-    
+  
+let stack : context -> expression -> value =
+  fun ctx e ->
+  match e.exp_desc with
+  | Texp_ident (path,_,_) ->
+    (match V.find ctx.st (Path.name path) with
+     | Some v -> v
+     | _ -> raise (Fail "malformed stack"))
+  | _ -> raise (Eval "expression not in let-normal form")
+  
 let rec eval' : context -> Typedtree.expression -> result = 
 fun ctx exp -> match exp.exp_desc with
 | Texp_ident (path,_,_) ->
@@ -314,72 +323,54 @@ fun ctx exp -> match exp.exp_desc with
   let hp' = H.add ctx.hp l v in
   v,hp',f'
 
-| Texp_construct (_, {Types.cstr_name = "::"}, [e1;e2]) ->
-  let free = locs ctx Var.empty e2 in 
-  let ctx1 = {ctx with r = R.union ctx.r free} in 
-  let v1,hp1,f1 = eval' ctx1 e1 in
-  let ctx2 = {ctx with hp = hp1; f = f1} in 
-  let r = R.union ctx.r free in 
-  let g = collect ctx2 r in 
-  let ctx3 = {ctx2 with f = F.union ctx2.f g} in 
-  let v2,hp2,f2 = eval' ctx3 e2 in 
-  let l,f' = new_loc f2 in
+| Texp_construct (_, {Types.cstr_name = "::"}, [x1;x2]) ->
+  let v1,v2 = stack ctx x1, stack ctx x2 in 
+  let l,f' = new_loc ctx.f in
   let v = Pair (v1,v2,l) in
-  let hp' = H.add hp2 l v in
+  let hp' = H.add ctx.hp l v in
   v,hp',f'
 
 | Texp_construct _ -> raise (Eval "unsupported constructor")
 
-| Texp_tuple (e::es) -> 
-  let free = List.map es (locs ctx Var.empty) |> R.union_list in 
-  let v1,h1,f1 = eval' {ctx with r = R.union ctx.r free} e in
-  List.foldi es ~init:(v1,h1,f1) ~f:(fun i (v,h,f) e -> 
-    let after = List.drop es (i+1) in 
-    let free = List.map after (locs ctx Var.empty) |> R.union_list in
-    let hold = R.add free (get_loc v)  in
-    let ctx' = {ctx with hp = h; r = R.union ctx.r hold; f = f} in 
-    let g = collect ctx' (R.union ctx'.r (locs ctx' Var.empty e)) in 
-    let ctx2 = {ctx' with f = F.union ctx'.f g} in 
-    let vc,hc,fc = eval' ctx2 e in 
-      let l,f' = new_loc fc in 
-      let v' = Pair (v,vc,l) in 
-      let hp' = H.add hc l v' in
-      v',hp', f')
+| Texp_tuple [x1;x2] -> 
+  let v1,v2 = stack ctx x1, stack ctx x2 in 
+  let l,f' = new_loc ctx.f in
+  let v = Pair (v1,v2,l) in
+  let hp' = H.add ctx.hp l v in
+  v,hp',f'
 
-| Texp_match (e,[{c_lhs = {pat_desc = Tpat_tuple ps} as p; c_rhs=e'}],_,_) ->
-  let free = locs ctx (bound_names p) e' in 
-  let v,hp',f' = eval' {ctx with r = R.union ctx.r free} e in 
-  let bound_vars = List.map ps (fun p -> match p.pat_desc with Tpat_var (ident,_) -> Path.name (Path.Pident ident) | _ -> raise (Eval "pattern not in let-normal form")) in
-  let vals = unravel (List.length bound_vars - 1) v in 
-  let st' = try List.fold2_exn bound_vars vals ~init:ctx.st ~f:(fun acc a b -> V.add acc a b) with Invalid_argument _ -> raise (Fail "tuple unraveling failed") in 
-  let ctx' = {ctx with  st = st'; hp = hp';f = f'} in 
-  let r = R.union ctx'.r (locs ctx' Var.empty e') in 
-  let g = collect ctx' r in 
-  let ctx2 = {ctx' with f = F.union ctx'.f g} in 
-  eval' ctx2 e'
+| Texp_match (x,[{c_lhs = {pat_desc = Tpat_tuple ps} as p; c_rhs=e'}],_,_) ->
+  let v = stack ctx x in 
+  let [x1;x2] = List.map ps (fun p -> match p.pat_desc with Tpat_var (ident,_) -> Path.name (Path.Pident ident) | _ -> raise (Eval "pattern not in let-normal form")) in
+  begin
+  match v with 
+  | Pair (v1,v2,l) -> 
+    let st' = V.add ctx.st x1 v1 in 
+    let st'' = V.add st' x1 v2 in 
+    let ctx' = {ctx with st=st''} in
+    let r' = R.union ctx'.r (locs ctx' Var.empty e') in
+    let g = collect ctx' r' in 
+    eval' ({ctx' with f = F.union ctx'.f g}) e'
+  | _ -> raise (Fail "invalid value: tuple expected")
+  end
 
-
-| Texp_match (e,[{c_lhs={pat_desc = Tpat_construct (_,{Types.cstr_name="[]"},[])}; c_rhs = e1}; {c_lhs={pat_desc = Tpat_construct (_,{Types.cstr_name=name},ps)} as p; c_rhs = e2}],_,_) ->
+| Texp_match (x,[{c_lhs={pat_desc = Tpat_construct (_,{Types.cstr_name="[]"},[])}; c_rhs = e1}; {c_lhs={pat_desc = Tpat_construct (_,{Types.cstr_name=name},ps)} as p; c_rhs = e2}],_,_) ->
   begin 
     match name with 
     | "::" -> 
-      let free = R.union (locs ctx Var.empty e1) (locs ctx (bound_names p) e2) in 
-      let v,hp',f' = eval' {ctx with r = R.union ctx.r free} e in 
       begin
-      match v with
+      match stack ctx x with
       | Null l -> 
-      let ctx' = {ctx with f = f'; hp = hp'} in 
-      let r = R.union ctx'.r (locs ctx' Var.empty e1) in 
-      let g = collect ctx' r in
-      let ctx2 = {ctx' with f = F.union ctx'.f g} in
-      eval' ctx2 e1
+        let r = R.union ctx.r (locs ctx Var.empty e1) in 
+        let g = collect ctx r in
+        let ctx2 = {ctx with f = F.union ctx.f g} in
+        eval' ctx2 e1
       | Pair(v1,v2,l) ->
         let [x1;x2] = List.map ps (fun p -> match p.pat_desc with Tpat_var (ident,_) -> Path.name (Path.Pident ident) | _ -> raise (Eval "pattern not in let-normal form")) in
         let st' = V.add (V.add ctx.st x1 v1) x2 v2 in
-        let ctx' = {ctx with st = st'; f = f'; hp = hp'} in 
-        let r = R.union ctx'.r (locs ctx' Var.empty e2) in  
-        let g = collect ctx' r in
-        let ctx2 = {ctx' with f = F.union ctx'.f g} in
+        let r = R.union ctx.r (locs ctx Var.empty e2) in 
+        let g = collect ctx r in
+        let ctx2 = {ctx with st=st'; f = F.union ctx.f g} in
         eval' ctx2 e2
       | _ -> raise (Fail "invalid value: nil or cons expected")
       end
@@ -392,42 +383,37 @@ fun ctx exp -> match exp.exp_desc with
   let hp' = H.add ctx.hp l v in
   v,hp',f'
 
-| Texp_apply (e1, es) ->
-  let args  = List.map es (fun (_,eo,_) -> match eo with Some e -> e | _ -> raise (Eval "labeled arguments not supported")) in 
-  let free = List.map args (locs ctx Var.empty) |> R.union_list in 
-  let v1,h1,f1 = eval' {ctx with r = R.union ctx.r free} e1 in
-  List.foldi args ~init:(v1,h1,f1) ~f:(fun i (fct,h,f) earg -> 
-    let after = List.drop args (i + 1) in
-    let free = List.map after (locs ctx Var.empty) |> R.union_list in
-    match fct with 
-    | Cl (cl,name,x,e,l) -> 
-    let hold = R.add free l in 
-    let ctx' = {ctx with f = f; hp = h; r = R.union ctx.r hold} in 
-    let r = R.union ctx'.r (locs ctx' Var.empty earg) in 
-    let g = collect ctx' r in
-    let ctx2 = {ctx' with f = F.union ctx'.f g} in 
-    let arg,hp',f' = eval' ctx2 earg in 
-    let st' = V.add cl x arg in
+| Texp_apply (f, [(_,Some arg,_)]) ->
+  let fv,v1 = stack ctx f, stack ctx arg in 
+  begin
+  match fv with
+  | Cl (cl,name,x,e,l) -> 
+    let r = R.union ctx.r (locs ctx Var.empty e) in 
+    let g = collect ctx r in
+    let st' = V.add cl x v1 in
     let st'' = match name with Some fname -> V.add st' fname (Cl(ctx.st,name,x,e,l)) | _ -> st' in 
-    let ctx' = {ctx with f = f'; st = st''; hp = hp'; r = R.union ctx.r free} in 
-    let r1 = 
-    eval' ctx' e in r1
+    let ctx' = {ctx with st = st''; f = F.union ctx.f g} in 
+    eval' ctx' e
 
-    | Cont cont ->
-    let arg,hp',f' = eval' {ctx with f = f; hp = h; r = R.union ctx.r free} earg in 
-    cont {ctx with f = f'; hp = hp'} arg
+  | Cont cont -> cont ctx fv
 
-    | _ -> raise (Fail "cannot apply non-function type"))
+  | _ -> raise (Fail "cannot apply non-function type")
+  end
 
 
-| Texp_ifthenelse (e,et,Some ef) -> 
-    let free = R.union (locs ctx Var.empty et) (locs ctx Var.empty ef) in 
-    let v,hp',f' = eval' {ctx with r = R.union ctx.r free} e in 
-    let ctx' = {ctx with f = f'; hp = hp'} in 
+| Texp_ifthenelse (x,e1,Some e2) -> 
     begin
-      match v with
-    | T _ -> eval' ctx' et
-    | F _ -> eval' ctx' ef
+      match stack ctx x with
+    | T _ -> 
+    let r = R.union ctx.r (locs ctx Var.empty e1) in 
+    let g = collect ctx r in
+    let ctx' = {ctx with f = F.union ctx.f g} in 
+    eval' ctx' e1
+    | F _ -> 
+    let r = R.union ctx.r (locs ctx Var.empty e2) in 
+    let g = collect ctx r in
+    let ctx' = {ctx with f = F.union ctx.f g} in 
+    eval' ctx' e2
     | _ -> raise (Fail "invalid value: bool expected")
     end
 
